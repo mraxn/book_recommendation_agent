@@ -211,6 +211,41 @@ def test_rank_candidates_excludes_title_reference_itself() -> None:
     assert [item.candidate.id for item in ranked] == ["alternative"]
 
 
+def test_rank_candidates_excludes_reference_title_variants() -> None:
+    request = book_agent.ExtractedRequest(
+        query="Suggest books for someone who loved The Count of Monte Cristo",
+        intent="title_reference",
+        title_reference="The Count of Monte Cristo",
+        topics=("revenge", "justice"),
+    )
+    candidates = book_agent.candidates_from_matches(
+        [
+            make_match(
+                book_id="source",
+                score=0.99,
+                title="The Count of Monte Cristo",
+                subjects=["Revenge"],
+            ),
+            make_match(
+                book_id="source-volume",
+                score=0.98,
+                title="The Count of Monte Cristo, Volume 1",
+                subjects=["Revenge"],
+            ),
+            make_match(
+                book_id="alternative",
+                score=0.8,
+                title="The Son of Monte-Cristo",
+                subjects=["Revenge"],
+            ),
+        ]
+    )
+
+    ranked = book_agent.rank_candidates(candidates, request, enforce_hard_filters=False)
+
+    assert [item.candidate.id for item in ranked] == ["alternative"]
+
+
 def test_select_recommendations_clamps_count() -> None:
     candidates = [
         book_agent.RankedCandidate(

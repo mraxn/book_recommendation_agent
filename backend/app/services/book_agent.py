@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, TypedDict, cast
@@ -80,20 +81,27 @@ ANSWER_PROMPT = """Write a concise book recommendation answer in markdown.
 Use only the supplied retrieved books. Do not mention any other book title.
 
 Required format:
-- Start with one short sentence.
+- Start with this exact opening sentence, unchanged:
+  {opening_sentence}
 - Then write a numbered markdown list only.
 - Every recommendation line must start with "1. ", "2. ", "3. ", etc.
 - The first character of each recommendation line must be the number, never "-".
 - Wrap every book title in **bold markdown** exactly as supplied.
 - Do not use bullet points, hyphen lists, tables, or headings.
+- Do not add any text after the numbered list.
+- Use each supplied book at most once. Do not repeat a title.
 - Each item must follow this pattern:
   N. **exact supplied title** by supplied author (year if known) - specific reason from the supplied reason/text.
 - Do not copy template words or use generic placeholder reasons.
 - Reasons must be concrete and based on the supplied retrieved-book data.
+- If the user asks for books like one they already loved, recommend alternatives only.
+- Do not recommend or name the user's source/reference book unless it is one of the supplied retrieved books.
+- The opening sentence must not include any book title.
 
 Do not write "Reason sentence" or similar placeholder text.
+Do not write "The user is looking for" or describe the task.
 
-User request: {query}
+User preference context: {query_context}
 
 Retrieved books:
 {books}
@@ -240,6 +248,20 @@ class LLMProvider(Protocol):
 logger = logging.getLogger(__name__)
 
 
+def configure_book_agent_logging(level_name: str | None = None) -> None:
+    resolved_level = level_name or os.getenv("BOOK_AGENT_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
+    level = getattr(logging, resolved_level.upper(), logging.INFO)
+    logger.setLevel(level)
+
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+        logger.addHandler(handler)
+
+    logger.propagate = False
+    logger.info("Book agent logging configured level=%s", logging.getLevelName(level))
+
+
 @dataclass(frozen=True)
 class OllamaProvider:
     settings: ProviderSettings
@@ -380,6 +402,23 @@ class AnthropicProvider:
 
 def build_llm_provider(settings: ProviderSettings | None = None) -> LLMProvider:
     provider_settings = settings or get_provider_settings()
+    logger.info(
+        "Configuring LLM provider provider=%s timeout=%.1fs temperature=%.2f",
+        provider_settings.provider,
+        provider_settings.timeout_seconds,
+        provider_settings.temperature,
+    )
+    if provider_settings.provider == "ollama":
+        logger.info(
+            "Using Ollama model=%s base_url=%s",
+            provider_settings.ollama_model,
+            provider_settings.ollama_base_url,
+        )
+    elif provider_settings.provider == "openai":
+        logger.info("Using OpenAI model=%s", provider_settings.openai_model)
+    elif provider_settings.provider == "anthropic":
+        logger.info("Using Anthropic model=%s", provider_settings.anthropic_model)
+
     if provider_settings.provider == "openai":
         return OpenAIProvider(provider_settings)
     if provider_settings.provider == "anthropic":
@@ -479,6 +518,8 @@ def parse_requested_count(text: str) -> int:
             return count
 
     if re.search(r"\b(?:one|a)\s+(?:book|novel|recommendation)\b", normalized):
+        return 1
+    if re.search(r"\b(?:only|just)\s+one\b", normalized):
         return 1
     if re.search(r"\b(?:best|single)\s+(?:book|novel|recommendation)\b", normalized):
         return 1
@@ -605,9 +646,18 @@ def heuristic_extract_request(messages: list[ChatMessage]) -> ExtractedRequest:
     reference_intent, detected_title = detect_title_reference(last_user_message)
     author = detect_author_query(last_user_message)
     normalized = normalize_text(last_user_message)
+    inherited_title_reference = _last_title_reference_from_history(messages)
+    has_follow_up_pointer = bool(
+        re.search(
+            r"\b(?:from those|from these|of those|of these|the first one|the second one|the third one|those|these)\b",
+            normalized,
+        )
+    )
 
     if is_obvious_off_topic(last_user_message):
         intent: Intent = "off_topic"
+    elif has_follow_up_pointer:
+        intent = "follow_up"
     elif reference_intent == "title_reference":
         intent = "title_reference"
     elif reference_intent == "title_lookup":
@@ -620,12 +670,19 @@ def heuristic_extract_request(messages: list[ChatMessage]) -> ExtractedRequest:
         intent = "recommendation"
 
     topics = _extract_topic_terms(last_user_message)
+    if detected_title and intent == "title_reference":
+        topics = _remove_reference_terms_from_topics(topics, detected_title)
+    if intent == "follow_up" and inherited_title_reference:
+        topics = _remove_reference_terms_from_topics(topics, inherited_title_reference)
+    title_reference = detected_title if intent == "title_reference" else None
+    if intent == "follow_up" and inherited_title_reference:
+        title_reference = inherited_title_reference
     return ExtractedRequest(
         query=last_user_message,
         intent=intent,
         author=author,
         title=detected_title if intent == "title_lookup" else None,
-        title_reference=detected_title if intent == "title_reference" else None,
+        title_reference=title_reference,
         language_code=language_code,
         language_name=language_name,
         year=parse_year_constraint(last_user_message),
@@ -643,7 +700,30 @@ async def extract_request_with_provider(
     base_request: ExtractedRequest | None = None,
 ) -> ExtractedRequest:
     base = base_request or heuristic_extract_request(messages)
+    logger.info(
+        "Heuristic extraction intent=%s count=%s language=%s year=%s title_ref=%s query=%s",
+        base.intent,
+        base.requested_count,
+        base.language_code or "-",
+        _year_summary(base.year),
+        bool(base.title_reference),
+        _query_preview(base.query),
+    )
+    logger.debug(
+        "Heuristic extraction details author=%s title=%s title_reference=%s topics=%s popular=%s broad=%s",
+        base.author,
+        base.title,
+        base.title_reference,
+        base.topics,
+        base.wants_popular,
+        base.is_broad,
+    )
     if provider is None or base.intent == "off_topic":
+        logger.debug(
+            "Skipping LLM extraction provider_available=%s intent=%s",
+            provider is not None,
+            base.intent,
+        )
         return base
 
     prompt = EXTRACTION_PROMPT.format(
@@ -651,11 +731,34 @@ async def extract_request_with_provider(
         query=base.query,
     )
     try:
+        start = time.perf_counter()
         payload = await asyncio.to_thread(provider.complete_json, prompt)
+        logger.debug(
+            "LLM extraction completed provider=%s elapsed_ms=%d",
+            getattr(provider, "name", "unknown"),
+            _elapsed_ms(start),
+        )
     except Exception as exc:
         logger.warning("LLM extraction failed with %s: %s", getattr(provider, "name", "unknown"), exc)
         return base
-    return merge_llm_extraction(base, payload)
+    merged = merge_llm_extraction(base, payload)
+    logger.info(
+        "Merged extraction intent=%s count=%s language=%s year=%s title_ref=%s topics=%d",
+        merged.intent,
+        merged.requested_count,
+        merged.language_code or "-",
+        _year_summary(merged.year),
+        bool(merged.title_reference),
+        len(merged.topics),
+    )
+    logger.debug(
+        "Merged extraction details author=%s title=%s title_reference=%s topics=%s",
+        merged.author,
+        merged.title,
+        merged.title_reference,
+        merged.topics,
+    )
+    return merged
 
 
 def merge_llm_extraction(base: ExtractedRequest, payload: Any) -> ExtractedRequest:
@@ -676,10 +779,10 @@ def merge_llm_extraction(base: ExtractedRequest, payload: Any) -> ExtractedReque
         year = _year_from_llm_payload(payload)
 
     topics = _merge_topics(base.topics, payload.get("topics"))
-    requested_count = base.requested_count
-    llm_count = _coerce_count(payload.get("requested_count"))
-    if base.requested_count == 3 and llm_count is not None:
-        requested_count = llm_count
+    title_reference = _clean_title_phrase(_clean_optional_string(payload.get("title_reference")) or "")
+    effective_title_reference = title_reference or base.title_reference
+    if effective_title_reference:
+        topics = tuple(_remove_reference_terms_from_topics(list(topics), effective_title_reference))
 
     typed_intent = cast(Intent, intent)
     return replace(
@@ -687,12 +790,12 @@ def merge_llm_extraction(base: ExtractedRequest, payload: Any) -> ExtractedReque
         intent=typed_intent,
         author=_clean_optional_string(payload.get("author")) or base.author,
         title=_clean_optional_string(payload.get("title")) or base.title,
-        title_reference=_clean_optional_string(payload.get("title_reference")) or base.title_reference,
+        title_reference=effective_title_reference,
         language_code=language_code,
         language_name=language_name,
         year=year,
         topics=topics,
-        requested_count=requested_count,
+        requested_count=base.requested_count,
         wants_popular=base.wants_popular or bool(payload.get("wants_popular")),
         is_broad=base.is_broad or bool(payload.get("is_broad")),
     )
@@ -763,22 +866,51 @@ def rank_candidates(
     enforce_hard_filters: bool = True,
 ) -> list[RankedCandidate]:
     deduped = deduplicate_candidates(candidates)
+    logger.info(
+        "Ranking candidates received=%d deduped=%d enforce_hard_filters=%s",
+        len(candidates),
+        len(deduped),
+        enforce_hard_filters,
+    )
     if request.title_reference:
-        reference_title = normalize_title(request.title_reference)
+        before_reference_filter = len(deduped)
         deduped = [
             candidate
             for candidate in deduped
-            if normalize_title(candidate.title) != reference_title
+            if not _is_reference_title_candidate(candidate.title, request.title_reference)
         ]
+        logger.info(
+            "Applied title-reference exclusion title_ref=%s removed=%d remaining=%d",
+            request.title_reference,
+            before_reference_filter - len(deduped),
+            len(deduped),
+        )
     if enforce_hard_filters:
+        before_hard_filters = len(deduped)
         deduped = [candidate for candidate in deduped if candidate_matches_request(candidate, request)]
+        logger.info(
+            "Applied hard filters removed=%d remaining=%d",
+            before_hard_filters - len(deduped),
+            len(deduped),
+        )
     filtered = filter_candidates_by_relative_score(deduped)
     if not filtered:
+        logger.info("No candidates remained after relative score filtering")
         return []
 
     top_score = max((candidate.score for candidate in filtered), default=0.0)
     ranked = [_score_candidate(candidate, request, top_score) for candidate in filtered]
-    return sorted(ranked, key=lambda item: item.rank_score, reverse=True)
+    sorted_ranked = sorted(ranked, key=lambda item: item.rank_score, reverse=True)
+    logger.info(
+        "Ranked candidates filtered=%d top_titles=%s",
+        len(sorted_ranked),
+        _ranked_title_summary(sorted_ranked),
+    )
+    logger.debug(
+        "Ranked candidate scores=%s",
+        [(item.candidate.id, round(item.rank_score, 3), item.reason) for item in sorted_ranked[:10]],
+    )
+    return sorted_ranked
 
 
 def select_recommendations(
@@ -786,7 +918,14 @@ def select_recommendations(
     requested_count: int,
 ) -> list[RankedCandidate]:
     count = max(1, min(5, requested_count))
-    return ranked_candidates[:count]
+    selected = ranked_candidates[:count]
+    logger.info(
+        "Selected recommendations requested=%d selected=%d titles=%s",
+        requested_count,
+        len(selected),
+        _ranked_title_summary(selected),
+    )
+    return selected
 
 
 def candidate_matches_request(candidate: BookCandidate, request: ExtractedRequest) -> bool:
@@ -823,22 +962,39 @@ async def maybe_llm_rerank(
     request: ExtractedRequest,
     provider: LLMProvider | None,
 ) -> list[RankedCandidate]:
-    if provider is None or len(ranked_candidates) < 5:
+    if provider is None:
+        logger.debug("Skipping LLM rerank because provider is unavailable")
+        return ranked_candidates
+    if len(ranked_candidates) < 5:
+        logger.debug("Skipping LLM rerank candidate_count=%d", len(ranked_candidates))
         return ranked_candidates
 
     candidates_for_prompt = ranked_candidates[:10]
+    logger.info(
+        "Starting LLM rerank provider=%s candidate_count=%d prompt_candidates=%d",
+        getattr(provider, "name", "unknown"),
+        len(ranked_candidates),
+        len(candidates_for_prompt),
+    )
     prompt = RERANK_PROMPT.format(
         query=request.query,
         candidates="\n".join(_candidate_prompt_line(item.candidate) for item in candidates_for_prompt),
     )
     try:
+        start = time.perf_counter()
         payload = await asyncio.to_thread(provider.complete_json, prompt)
+        logger.debug(
+            "LLM rerank completed provider=%s elapsed_ms=%d",
+            getattr(provider, "name", "unknown"),
+            _elapsed_ms(start),
+        )
     except Exception as exc:
         logger.warning("LLM rerank failed with %s: %s", getattr(provider, "name", "unknown"), exc)
         return ranked_candidates
 
     selected_ids = payload.get("selected_ids") if isinstance(payload, dict) else None
     if not isinstance(selected_ids, list):
+        logger.warning("LLM rerank returned invalid payload type=%s", type(payload).__name__)
         return ranked_candidates
 
     by_id = {item.candidate.id: item for item in ranked_candidates}
@@ -850,6 +1006,7 @@ async def maybe_llm_rerank(
             ordered.append(by_id[candidate_id])
             seen.add(candidate_id)
     ordered.extend(item for item in ranked_candidates if item.candidate.id not in seen)
+    logger.info("LLM rerank accepted selected_ids=%s", list(seen))
     return ordered
 
 
@@ -862,6 +1019,7 @@ async def generate_grounded_answer(
     relaxed_language: bool = False,
 ) -> str:
     if not selected:
+        logger.info("Generating deterministic no-results answer")
         return build_deterministic_answer(
             request,
             selected,
@@ -869,6 +1027,7 @@ async def generate_grounded_answer(
             relaxed_language=relaxed_language,
         )
     if provider is None:
+        logger.info("Generating deterministic answer because provider is unavailable selected=%d", len(selected))
         return build_deterministic_answer(
             request,
             selected,
@@ -876,14 +1035,29 @@ async def generate_grounded_answer(
             relaxed_language=relaxed_language,
         )
 
+    logger.info(
+        "Starting LLM answer generation provider=%s selected=%d relaxed_year=%s relaxed_language=%s",
+        getattr(provider, "name", "unknown"),
+        len(selected),
+        relaxed_year,
+        relaxed_language,
+    )
     prompt = ANSWER_PROMPT.format(
-        query=request.query,
+        opening_sentence=_answer_opening_sentence(request, len(selected)),
+        query_context=_answer_query_context(request),
         books="\n".join(_answer_prompt_line(item) for item in selected),
     )
     try:
+        start = time.perf_counter()
         answer = normalize_llm_answer_format(
             strip_model_artifacts(await asyncio.to_thread(provider.complete_text, prompt)),
             [item.candidate for item in selected],
+        )
+        logger.debug(
+            "LLM answer generation completed provider=%s elapsed_ms=%d chars=%d",
+            getattr(provider, "name", "unknown"),
+            _elapsed_ms(start),
+            len(answer),
         )
     except Exception as exc:
         logger.warning("LLM answer generation failed with %s: %s", getattr(provider, "name", "unknown"), exc)
@@ -894,10 +1068,15 @@ async def generate_grounded_answer(
             relaxed_language=relaxed_language,
         )
 
-    if answer_uses_numbered_list(answer) and answer_mentions_only_selected_titles(
-        answer,
-        [item.candidate for item in selected],
+    if (
+        answer_uses_numbered_list(answer)
+        and answer_mentions_only_selected_titles(
+            answer,
+            [item.candidate for item in selected],
+        )
+        and answer_has_unique_recommendation_titles(answer)
     ):
+        logger.info("LLM answer accepted selected=%d chars=%d", len(selected), len(answer))
         prefix = _relaxation_note(relaxed_year=relaxed_year, relaxed_language=relaxed_language)
         return f"{prefix}{answer}" if prefix else answer
 
@@ -918,12 +1097,18 @@ def build_deterministic_answer(
     relaxed_language: bool = False,
 ) -> str:
     if not selected:
+        logger.info("No selected recommendations available for deterministic answer")
         return "I could not find strong retrieved matches for that request."
 
-    count_word = "one" if len(selected) == 1 else str(len(selected))
+    logger.debug(
+        "Building deterministic answer selected=%d relaxed_year=%s relaxed_language=%s",
+        len(selected),
+        relaxed_year,
+        relaxed_language,
+    )
     lines = [
         _relaxation_note(relaxed_year=relaxed_year, relaxed_language=relaxed_language).rstrip(),
-        f"Here are {count_word} retrieved matches:",
+        _answer_opening_sentence(request, len(selected)),
         "",
     ]
     lines = [line for line in lines if line]
@@ -936,6 +1121,35 @@ def build_deterministic_answer(
     return "\n".join(lines)
 
 
+def _answer_opening_sentence(request: ExtractedRequest, selected_count: int) -> str:
+    count_word = "one" if selected_count == 1 else str(selected_count)
+    if request.title_reference:
+        noun = "alternative" if selected_count == 1 else "alternatives"
+    else:
+        noun = "match" if selected_count == 1 else "matches"
+    verb = "is" if selected_count == 1 else "are"
+    return f"Here {verb} {count_word} retrieved {noun}:"
+
+
+def _answer_query_context(request: ExtractedRequest) -> str:
+    if not request.title_reference:
+        return request.query
+
+    context_terms = [topic for topic in request.topics if topic]
+    if request.wants_popular:
+        context_terms.append("popular")
+    if request.language_name:
+        context_terms.append(f"{request.language_name} language")
+    if request.year:
+        context_terms.append("the requested publication period")
+
+    if context_terms:
+        return "The user wants alternative recommendations matching: " + ", ".join(
+            dict.fromkeys(context_terms)
+        )
+    return "The user wants alternative recommendations with similar themes."
+
+
 def answer_mentions_only_selected_titles(answer: str, selected: list[BookCandidate]) -> bool:
     selected_titles = {normalize_title(candidate.title) for candidate in selected}
     mentioned_titles = _extract_markdown_titles(answer)
@@ -946,6 +1160,11 @@ def answer_mentions_only_selected_titles(answer: str, selected: list[BookCandida
 
 def answer_uses_numbered_list(answer: str) -> bool:
     return bool(re.search(r"(?m)^\s*1\.\s+", answer))
+
+
+def answer_has_unique_recommendation_titles(answer: str) -> bool:
+    titles = [normalize_title(title) for title in _extract_markdown_titles(answer)]
+    return len(titles) == len(set(titles))
 
 
 def normalize_llm_answer_format(answer: str, selected: list[BookCandidate]) -> str:
@@ -964,6 +1183,15 @@ async def run_book_agent(
     search_fn: Any | None = None,
     provider: Any = _PROVIDER_UNSET,
 ) -> str:
+    start = time.perf_counter()
+    latest_user = next((message.content for message in reversed(messages) if message.role == "user"), "")
+    logger.info(
+        "Agent run started messages=%d latest_query=%s custom_search=%s provider_override=%s",
+        len(messages),
+        _query_preview(latest_user),
+        search_fn is not None,
+        provider is not _PROVIDER_UNSET,
+    )
     initial_state: AgentState = {"messages": messages}
     if search_fn is not None:
         initial_state["search_fn"] = search_fn
@@ -971,7 +1199,13 @@ async def run_book_agent(
         initial_state["provider"] = provider
 
     result = await _get_book_agent_graph().ainvoke(initial_state)
-    return result.get("final_answer") or "I could not produce a recommendation for that request."
+    answer = result.get("final_answer") or "I could not produce a recommendation for that request."
+    logger.info(
+        "Agent run completed elapsed_ms=%d answer_chars=%d",
+        _elapsed_ms(start),
+        len(answer),
+    )
+    return answer
 
 
 def build_pinecone_filter(
@@ -1029,7 +1263,26 @@ def build_initial_search_plans(request: ExtractedRequest) -> list[SearchPlan]:
         )
 
     plans.append(SearchPlan(query_text=build_semantic_query(request), filters=filters, purpose="main"))
-    return plans[:MAX_SEARCHES_PER_REQUEST]
+    bounded_plans = plans[:MAX_SEARCHES_PER_REQUEST]
+    logger.info(
+        "Built search plans count=%d purposes=%s filters=%s",
+        len(bounded_plans),
+        [plan.purpose for plan in bounded_plans],
+        [_filter_summary(plan.filters) for plan in bounded_plans],
+    )
+    logger.debug(
+        "Search plan details=%s",
+        [
+            {
+                "purpose": plan.purpose,
+                "top_k": plan.top_k,
+                "query": _query_preview(plan.query_text),
+                "filters": plan.filters,
+            }
+            for plan in bounded_plans
+        ],
+    )
+    return bounded_plans
 
 
 async def retrieve_candidates_for_request(
@@ -1042,24 +1295,51 @@ async def retrieve_candidates_for_request(
     search_count = 0
     relaxed_year = False
     relaxed_language = False
+    logger.info(
+        "Starting retrieval intent=%s language=%s year=%s title_ref=%s",
+        request.intent,
+        request.language_code or "-",
+        _year_summary(request.year),
+        bool(request.title_reference),
+    )
 
     for plan in build_initial_search_plans(request):
         try:
+            logger.info(
+                "Running search plan purpose=%s top_k=%d filters=%s query=%s",
+                plan.purpose,
+                plan.top_k,
+                _filter_summary(plan.filters),
+                _query_preview(plan.query_text),
+            )
+            start = time.perf_counter()
             matches = await asyncio.to_thread(search, plan.query_text, plan.filters, plan.top_k)
         except Exception as exc:
             errors.append(str(exc))
             logger.warning("Book search failed for %s plan: %s", plan.purpose, exc)
             continue
         search_count += 1
+        logger.info(
+            "Search plan completed purpose=%s matches=%d elapsed_ms=%d",
+            plan.purpose,
+            len(matches),
+            _elapsed_ms(start),
+        )
         candidates.extend(candidates_from_matches(matches))
 
     deduped = deduplicate_candidates(candidates)
+    logger.info("Retrieval after initial searches candidates=%d deduped=%d", len(candidates), len(deduped))
     if (
         request.year
         and len(deduped) < MIN_CANDIDATES_BEFORE_RELAX
         and search_count < MAX_SEARCHES_PER_REQUEST
     ):
         relaxed_year = True
+        logger.info(
+            "Relaxing year filter because deduped=%d threshold=%d",
+            len(deduped),
+            MIN_CANDIDATES_BEFORE_RELAX,
+        )
         plan = SearchPlan(
             query_text=build_semantic_query(request),
             filters=build_pinecone_filter(request, include_year=False),
@@ -1070,6 +1350,7 @@ async def retrieve_candidates_for_request(
         search_count += 1 if matches is not None else 0
         candidates.extend(candidates_from_matches(matches or []))
         deduped = deduplicate_candidates(candidates)
+        logger.info("After year relaxation candidates=%d deduped=%d", len(candidates), len(deduped))
 
     if (
         request.language_code
@@ -1077,6 +1358,7 @@ async def retrieve_candidates_for_request(
         and search_count < MAX_SEARCHES_PER_REQUEST
     ):
         relaxed_language = True
+        logger.info("Relaxing language filter because no deduped candidates remain")
         plan = SearchPlan(
             query_text=build_semantic_query(request),
             filters=build_pinecone_filter(request, include_language=False, include_year=not relaxed_year),
@@ -1088,10 +1370,19 @@ async def retrieve_candidates_for_request(
         search_count += 1 if matches is not None else 0
         candidates.extend(candidates_from_matches(matches or []))
         deduped = deduplicate_candidates(candidates)
+        logger.info("After language relaxation candidates=%d deduped=%d", len(candidates), len(deduped))
 
     if not deduped and errors:
         raise RetrievalError("; ".join(errors))
 
+    logger.info(
+        "Retrieval completed candidates=%d searches=%d relaxed_year=%s relaxed_language=%s errors=%d",
+        len(deduped),
+        search_count,
+        relaxed_year,
+        relaxed_language,
+        len(errors),
+    )
     return RetrievalResult(
         candidates=deduped,
         relaxed_year=relaxed_year,
@@ -1143,13 +1434,60 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
+
+
+def _query_preview(value: str, max_chars: int = 120) -> str:
+    preview = " ".join(value.split())
+    if len(preview) <= max_chars:
+        return preview
+    return f"{preview[: max_chars - 3]}..."
+
+
+def _year_summary(year: YearConstraint | None) -> str:
+    if year is None:
+        return "-"
+    parts: list[str] = []
+    if year.gte is not None:
+        parts.append(f">={year.gte}")
+    if year.lte is not None:
+        parts.append(f"<={year.lte}")
+    return ",".join(parts) or "-"
+
+
+def _filter_summary(filters: dict[str, Any] | None) -> str:
+    if not filters:
+        return "-"
+    return ",".join(sorted(filters))
+
+
+def _ranked_title_summary(items: list[RankedCandidate], limit: int = 3) -> list[str]:
+    return [item.candidate.title for item in items[:limit]]
+
+
 async def _run_search_plan(
     search: Any,
     plan: SearchPlan,
     errors: list[str],
 ) -> list[dict[str, Any]] | None:
     try:
-        return await asyncio.to_thread(search, plan.query_text, plan.filters, plan.top_k)
+        logger.info(
+            "Running fallback search plan purpose=%s top_k=%d filters=%s query=%s",
+            plan.purpose,
+            plan.top_k,
+            _filter_summary(plan.filters),
+            _query_preview(plan.query_text),
+        )
+        start = time.perf_counter()
+        matches = await asyncio.to_thread(search, plan.query_text, plan.filters, plan.top_k)
+        logger.info(
+            "Fallback search plan completed purpose=%s matches=%d elapsed_ms=%d",
+            plan.purpose,
+            len(matches),
+            _elapsed_ms(start),
+        )
+        return matches
     except Exception as exc:
         errors.append(str(exc))
         logger.warning("Book search failed for %s plan: %s", plan.purpose, exc)
@@ -1249,8 +1587,10 @@ def _build_book_agent_graph() -> Any:
 
 
 async def _extract_node(state: AgentState) -> AgentState:
+    logger.info("Graph node extract started")
     base_request = heuristic_extract_request(state["messages"])
     if base_request.intent == "off_topic":
+        logger.info("Graph node extract classified off_topic query=%s", _query_preview(base_request.query))
         return {
             "request": base_request,
             "final_answer": (
@@ -1273,6 +1613,11 @@ async def _extract_node(state: AgentState) -> AgentState:
         updates.get("provider"),
         base_request=base_request,
     )
+    logger.info(
+        "Graph node extract completed intent=%s count=%s",
+        updates["request"].intent,
+        updates["request"].requested_count,
+    )
     return updates
 
 
@@ -1281,6 +1626,7 @@ def _route_after_extract(state: AgentState) -> str:
 
 
 async def _retrieve_node(state: AgentState) -> AgentState:
+    logger.info("Graph node retrieve started")
     request = state["request"]
     try:
         retrieval = await retrieve_candidates_for_request(request, search_fn=state.get("search_fn"))
@@ -1290,13 +1636,20 @@ async def _retrieve_node(state: AgentState) -> AgentState:
             "retrieval": RetrievalResult(candidates=[], errors=(str(exc),)),
             "final_answer": "I could not search the book index right now. Please try again later.",
         }
+    logger.info(
+        "Graph node retrieve completed candidates=%d searches=%d",
+        len(retrieval.candidates),
+        retrieval.search_count,
+    )
     return {"retrieval": retrieval}
 
 
 async def _rank_node(state: AgentState) -> AgentState:
     if state.get("final_answer"):
+        logger.debug("Graph node rank skipped because final answer already exists")
         return {}
 
+    logger.info("Graph node rank started")
     request = state["request"]
     retrieval = state["retrieval"]
     enforce_filters = not (retrieval.relaxed_year or retrieval.relaxed_language)
@@ -1307,13 +1660,20 @@ async def _rank_node(state: AgentState) -> AgentState:
     )
     ranked = await maybe_llm_rerank(ranked, request, state.get("provider"))
     selected = select_recommendations(ranked, request.requested_count)
+    logger.info(
+        "Graph node rank completed ranked=%d selected=%d",
+        len(ranked),
+        len(selected),
+    )
     return {"ranked_candidates": ranked, "selected": selected}
 
 
 async def _answer_node(state: AgentState) -> AgentState:
     if state.get("final_answer"):
+        logger.debug("Graph node answer skipped because final answer already exists")
         return {}
 
+    logger.info("Graph node answer started")
     retrieval = state["retrieval"]
     answer = await generate_grounded_answer(
         state["request"],
@@ -1322,6 +1682,7 @@ async def _answer_node(state: AgentState) -> AgentState:
         relaxed_year=retrieval.relaxed_year,
         relaxed_language=retrieval.relaxed_language,
     )
+    logger.info("Graph node answer completed chars=%d", len(answer))
     return {"final_answer": answer}
 
 
@@ -1363,6 +1724,14 @@ def _first_balanced_json(text: str) -> str | None:
 def _clean_title_phrase(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" .?!'\"")
     value = re.sub(r"^(?:the book|book|novel)\s+", "", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"\s*,\s*(?:especially|particularly|specifically|mainly|mostly|preferably|with)\b.*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.split(r"\s+(?:but|while|because)\s+", value, maxsplit=1, flags=re.IGNORECASE)[0]
+    value = re.split(r"\s+(?:-|--|\u2013|\u2014)\s+", value, maxsplit=1)[0]
     return value.strip()
 
 
@@ -1388,6 +1757,25 @@ def _extract_topic_terms(text: str) -> list[str]:
     }
     words = re.findall(r"[a-zA-Z][a-zA-Z'-]{2,}", normalized)
     return [word for word in words if word not in stop_words and word not in LANGUAGE_NAME_TO_CODE]
+
+
+def _remove_reference_terms_from_topics(topics: list[str], title_reference: str) -> list[str]:
+    reference_terms = set(re.findall(r"[a-zA-Z][a-zA-Z'-]{2,}", normalize_title(title_reference)))
+    reference_terms.update({"like", "loved", "someone", "especially"})
+    return [topic for topic in topics if normalize_text(topic) not in reference_terms]
+
+
+def _last_title_reference_from_history(messages: list[ChatMessage]) -> str | None:
+    previous_user_messages = [
+        message.content
+        for message in messages[:-1]
+        if message.role == "user"
+    ]
+    for content in reversed(previous_user_messages):
+        intent, title = detect_title_reference(content)
+        if intent == "title_reference" and title:
+            return title
+    return None
 
 
 def _format_recent_conversation(messages: list[ChatMessage]) -> str:
@@ -1433,13 +1821,6 @@ def _merge_topics(base_topics: tuple[str, ...], llm_topics: Any) -> tuple[str, .
             if clean_topic and clean_topic not in merged:
                 merged.append(clean_topic)
     return tuple(merged)
-
-
-def _coerce_count(value: Any) -> int | None:
-    coerced = _safe_int(value)
-    if coerced is None:
-        return None
-    return max(1, min(5, coerced))
 
 
 def _clean_optional_string(value: Any) -> str | None:
@@ -1514,6 +1895,16 @@ def _matches_author(candidate: BookCandidate, author_query: str) -> bool:
     )
 
 
+def _is_reference_title_candidate(candidate_title: str, reference_title: str) -> bool:
+    candidate = normalize_title(candidate_title)
+    reference = normalize_title(reference_title)
+    if not candidate or not reference:
+        return False
+    if candidate == reference:
+        return True
+    return candidate.startswith(f"{reference} ")
+
+
 def _author_variants(author: str) -> set[str]:
     normalized = normalize_text(author)
     variants = {normalized}
@@ -1562,7 +1953,9 @@ def _extract_anthropic_content(response: Any) -> str:
 async def stream_book_agent_response(messages: list[ChatMessage]) -> AsyncIterator[str]:
     """Stream validated text chunks for the book recommendation agent."""
     answer = await run_book_agent(messages)
-    for chunk in chunk_text(answer):
+    chunks = chunk_text(answer)
+    logger.info("Streaming answer chunks=%d chars=%d", len(chunks), len(answer))
+    for chunk in chunks:
         yield chunk
 
 

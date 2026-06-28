@@ -10,9 +10,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.schemas import ChatRequest, StreamChunk
-from backend.app.services.book_agent import stream_book_agent_response
+from backend.app.services.book_agent import configure_book_agent_logging, stream_book_agent_response
 
 load_dotenv()
+configure_book_agent_logging()
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 FRONTEND_DIR = ROOT_DIR / "frontend"

@@ -116,8 +116,26 @@ def test_generate_grounded_answer_rejects_non_numbered_llm_output() -> None:
 
     answer = run(book_agent.generate_grounded_answer(request, selected, provider))
 
-    assert answer.startswith("Here are")
+    assert answer.startswith("Here is one retrieved match")
     assert "1. **Frankenstein**" in answer
+
+
+def test_generate_grounded_answer_rejects_duplicate_llm_titles() -> None:
+    selected = [
+        ranked("1", "Frankenstein"),
+        ranked("2", "Dracula"),
+    ]
+    provider = FakeProvider(
+        text="Here are two retrieved matches:\n"
+        "1. **Frankenstein** by Shelley - specific reason.\n"
+        "2. **Frankenstein** by Shelley - repeated reason."
+    )
+    request = book_agent.ExtractedRequest(query="gothic", intent="recommendation", requested_count=2)
+
+    answer = run(book_agent.generate_grounded_answer(request, selected, provider))
+
+    assert answer.count("**Frankenstein**") == 1
+    assert "**Dracula**" in answer
 
 
 def test_generate_grounded_answer_falls_back_when_provider_fails() -> None:
@@ -141,6 +159,39 @@ def test_build_deterministic_answer_mentions_relaxed_filters() -> None:
     assert "**A Book**" in answer
 
 
+def test_answer_opening_sentence_uses_alternatives_for_title_reference() -> None:
+    request = book_agent.ExtractedRequest(
+        query="Suggest books for someone who loved The Count of Monte Cristo",
+        intent="title_reference",
+        title_reference="The Count of Monte Cristo",
+    )
+
+    assert book_agent._answer_opening_sentence(request, 3) == "Here are 3 retrieved alternatives:"
+    assert book_agent._answer_opening_sentence(request, 1) == "Here is one retrieved alternative:"
+
+
+def test_answer_opening_sentence_uses_matches_for_regular_recommendations() -> None:
+    request = book_agent.ExtractedRequest(query="Recommend gothic books", intent="recommendation")
+
+    assert book_agent._answer_opening_sentence(request, 3) == "Here are 3 retrieved matches:"
+    assert book_agent._answer_opening_sentence(request, 1) == "Here is one retrieved match:"
+
+
+def test_answer_query_context_hides_source_title_for_title_reference() -> None:
+    request = book_agent.ExtractedRequest(
+        query="Suggest books for someone who loved The Count of Monte Cristo, especially revenge",
+        intent="title_reference",
+        title_reference="The Count of Monte Cristo",
+        topics=("revenge", "justice"),
+    )
+
+    context = book_agent._answer_query_context(request)
+
+    assert "The Count of Monte Cristo" not in context
+    assert "alternative recommendations" in context
+    assert "revenge" in context
+
+
 def test_answer_validation_requires_selected_markdown_titles() -> None:
     selected = [book_agent.BookCandidate(id="1", score=1, title="Frankenstein")]
 
@@ -152,6 +203,15 @@ def test_answer_validation_requires_selected_markdown_titles() -> None:
 def test_answer_uses_numbered_list() -> None:
     assert book_agent.answer_uses_numbered_list("Intro\n1. **Book** by Author - reason.")
     assert not book_agent.answer_uses_numbered_list("- **Book** by Author - reason.")
+
+
+def test_answer_has_unique_recommendation_titles() -> None:
+    assert book_agent.answer_has_unique_recommendation_titles(
+        "1. **Frankenstein** by Shelley - reason.\n2. **Dracula** by Stoker - reason."
+    )
+    assert not book_agent.answer_has_unique_recommendation_titles(
+        "1. **Frankenstein** by Shelley - reason.\n2. **Frankenstein** by Shelley - reason."
+    )
 
 
 def test_normalize_llm_answer_format_preserves_good_numbered_content() -> None:
@@ -193,5 +253,8 @@ def test_answer_prompt_explicitly_forbids_bullet_lists() -> None:
     assert 'never "-"' in book_agent.ANSWER_PROMPT
     assert "Wrap every book title in **bold markdown**" in book_agent.ANSWER_PROMPT
     assert "Do not use bullet points" in book_agent.ANSWER_PROMPT
+    assert "Do not repeat a title" in book_agent.ANSWER_PROMPT
+    assert "recommend alternatives only" in book_agent.ANSWER_PROMPT
+    assert "opening sentence must not include any book title" in book_agent.ANSWER_PROMPT
     assert 'Do not write "Reason sentence"' in book_agent.ANSWER_PROMPT
     assert "specific reason from the supplied reason/text" in book_agent.ANSWER_PROMPT

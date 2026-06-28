@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -63,6 +64,8 @@ def test_provider_settings_reads_clean_env_defaults(monkeypatch: pytest.MonkeyPa
         ("Suggest three novels about travel", 3),
         ("I want one book about survival", 1),
         ("What is the best book about politics?", 1),
+        ("Give me only one from those", 1),
+        ("Just one revenge story", 1),
         ("Suggest some adventure books", 5),
         ("Recommend something gothic", 3),
     ],
@@ -102,6 +105,11 @@ def test_parse_year_constraint_before_after_and_between() -> None:
         ("I want something like Frankenstein", "title_reference", "Frankenstein"),
         (
             'Suggest a book for someone who loved "The Count of Monte Cristo"',
+            "title_reference",
+            "The Count of Monte Cristo",
+        ),
+        (
+            "Suggest books for someone who loved The Count of Monte Cristo, especially revenge, imprisonment, justice, disguise, and long-term plotting.",
             "title_reference",
             "The Count of Monte Cristo",
         ),
@@ -147,6 +155,39 @@ def test_chunk_text_preserves_content_without_empty_chunks() -> None:
     assert all(chunks)
 
 
+def test_logging_summary_helpers_are_stable() -> None:
+    assert book_agent._query_preview("a " * 100, max_chars=12).endswith("...")
+    assert book_agent._year_summary(book_agent.YearConstraint(gte=1800, lte=1900)) == ">=1800,<=1900"
+    assert book_agent._filter_summary({"languages": {"$in": ["en"]}, "first_publish_year": {}}) == (
+        "first_publish_year,languages"
+    )
+
+
+def test_configure_book_agent_logging_uses_env_level_without_duplicate_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_level = book_agent.logger.level
+    original_handlers = list(book_agent.logger.handlers)
+    original_propagate = book_agent.logger.propagate
+
+    try:
+        book_agent.logger.handlers.clear()
+        monkeypatch.setenv("BOOK_AGENT_LOG_LEVEL", "DEBUG")
+
+        book_agent.configure_book_agent_logging()
+        first_handler_count = len(book_agent.logger.handlers)
+        book_agent.configure_book_agent_logging()
+
+        assert book_agent.logger.level == logging.DEBUG
+        assert first_handler_count == 1
+        assert len(book_agent.logger.handlers) == first_handler_count
+        assert book_agent.logger.propagate is False
+    finally:
+        book_agent.logger.handlers[:] = original_handlers
+        book_agent.logger.setLevel(original_level)
+        book_agent.logger.propagate = original_propagate
+
+
 def test_heuristic_extract_request_combines_structured_signals() -> None:
     request = book_agent.heuristic_extract_request(
         user_message("Suggest 5 popular English books about ghosts before 1900")
@@ -186,6 +227,64 @@ def test_merge_llm_extraction_keeps_deterministic_language_and_year() -> None:
     assert "ghosts" in merged.topics
 
 
+def test_merge_llm_extraction_cleans_title_reference_suffix() -> None:
+    base = book_agent.heuristic_extract_request(user_message("Suggest books for someone who loved it"))
+
+    merged = book_agent.merge_llm_extraction(
+        base,
+        {
+            "intent": "title_reference",
+            "title_reference": "The Count of Monte Cristo, especially revenge and justice",
+        },
+    )
+
+    assert merged.intent == "title_reference"
+    assert merged.title_reference == "The Count of Monte Cristo"
+
+
+def test_title_reference_topics_exclude_source_title_terms() -> None:
+    request = book_agent.heuristic_extract_request(
+        user_message(
+            "Suggest books for someone who loved The Count of Monte Cristo, especially revenge, imprisonment, justice, disguise, and long-term plotting."
+        )
+    )
+
+    assert request.title_reference == "The Count of Monte Cristo"
+    assert "count" not in request.topics
+    assert "monte" not in request.topics
+    assert "cristo" not in request.topics
+    assert "revenge" in request.topics
+    assert "justice" in request.topics
+
+
+def test_follow_up_inherits_previous_title_reference() -> None:
+    messages = [
+        ChatMessage(
+            role="user",
+            content=(
+                "Suggest books for someone who loved The Count of Monte Cristo, "
+                "especially revenge and justice."
+            ),
+        ),
+        ChatMessage(
+            role="assistant",
+            content="1. **The Son of Monte-Cristo** by Lermina, Jules - revenge.",
+        ),
+        ChatMessage(
+            role="user",
+            content="Give me only one from those that feels most like a revenge story.",
+        ),
+    ]
+
+    request = book_agent.heuristic_extract_request(messages)
+
+    assert request.intent == "follow_up"
+    assert request.requested_count == 1
+    assert request.title_reference == "The Count of Monte Cristo"
+    assert "count" not in request.topics
+    assert "revenge" in request.topics
+
+
 def test_extract_request_with_provider_fills_gaps() -> None:
     provider = FakeExtractionProvider(
         {
@@ -205,5 +304,5 @@ def test_extract_request_with_provider_fills_gaps() -> None:
 
     assert request.intent == "author_lookup"
     assert request.author == "Mark Twain"
-    assert request.requested_count == 2
+    assert request.requested_count == 3
     assert "travel" in request.topics
