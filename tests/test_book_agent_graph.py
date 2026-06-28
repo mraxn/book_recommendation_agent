@@ -24,6 +24,31 @@ def test_run_book_agent_skips_search_for_obvious_off_topic() -> None:
     assert "book recommendations" in answer
 
 
+def test_run_book_agent_skips_search_for_llm_extracted_off_topic() -> None:
+    class OffTopicProvider:
+        name = "fake"
+
+        def complete_json(self, prompt: str) -> dict[str, object]:
+            return {"intent": "off_topic"}
+
+        def complete_text(self, prompt: str) -> str:
+            return ""
+
+    def failing_search(query: str, filters: dict[str, object] | None, top_k: int) -> list[dict[str, object]]:
+        raise AssertionError("search should not be called")
+
+    answer = run(
+        book_agent.run_book_agent(
+            messages("Plan my weekend itinerary"),
+            search_fn=failing_search,
+            provider=OffTopicProvider(),
+        )
+    )
+
+    assert isinstance(answer, str)
+    assert "book recommendations" in answer
+
+
 def test_run_book_agent_returns_retrieved_only_recommendations() -> None:
     def fake_search(query: str, filters: dict[str, object] | None, top_k: int) -> list[dict[str, object]]:
         return [

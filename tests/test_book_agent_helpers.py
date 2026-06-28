@@ -188,6 +188,27 @@ def test_configure_book_agent_logging_uses_env_level_without_duplicate_handlers(
         book_agent.logger.propagate = original_propagate
 
 
+def test_configure_book_agent_logging_falls_back_for_invalid_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_level = book_agent.logger.level
+    original_handlers = list(book_agent.logger.handlers)
+    original_propagate = book_agent.logger.propagate
+
+    try:
+        book_agent.logger.handlers.clear()
+        monkeypatch.setenv("BOOK_AGENT_LOG_LEVEL", "VERBOSE")
+
+        book_agent.configure_book_agent_logging()
+
+        assert book_agent.logger.level == logging.INFO
+        assert len(book_agent.logger.handlers) == 1
+    finally:
+        book_agent.logger.handlers[:] = original_handlers
+        book_agent.logger.setLevel(original_level)
+        book_agent.logger.propagate = original_propagate
+
+
 def test_heuristic_extract_request_combines_structured_signals() -> None:
     request = book_agent.heuristic_extract_request(
         user_message("Suggest 5 popular English books about ghosts before 1900")
@@ -207,6 +228,18 @@ def test_heuristic_extract_request_detects_author_lookup() -> None:
     assert request.intent == "author_lookup"
     assert request.author == "Mark Twain"
     assert "travel" in request.topics
+
+
+def test_heuristic_extract_request_stops_author_before_qualifiers() -> None:
+    request = book_agent.heuristic_extract_request(
+        user_message(
+            "Find books by Mark Twain that are connected to travel, journeys, "
+            "or observations about foreign places. Prefer popular works."
+        )
+    )
+
+    assert request.intent == "author_lookup"
+    assert request.author == "Mark Twain"
 
 
 def test_merge_llm_extraction_keeps_deterministic_language_and_year() -> None:
@@ -240,6 +273,63 @@ def test_merge_llm_extraction_cleans_title_reference_suffix() -> None:
 
     assert merged.intent == "title_reference"
     assert merged.title_reference == "The Count of Monte Cristo"
+
+
+def test_merge_llm_extraction_ignores_title_reference_for_author_lookup() -> None:
+    base = book_agent.heuristic_extract_request(user_message("Find books by Mark Twain about travel"))
+
+    merged = book_agent.merge_llm_extraction(
+        base,
+        {
+            "intent": "author_lookup",
+            "author": "Mark Twain",
+            "title_reference": "Mark Twain",
+        },
+    )
+
+    assert merged.intent == "author_lookup"
+    assert merged.author == "Mark Twain"
+    assert merged.title_reference is None
+
+
+def test_merge_llm_extraction_keeps_deterministic_author_when_llm_is_noisy() -> None:
+    base = book_agent.heuristic_extract_request(
+        user_message(
+            "Find books by Mark Twain that are connected to travel, journeys, "
+            "or observations about foreign places."
+        )
+    )
+
+    merged = book_agent.merge_llm_extraction(
+        base,
+        {
+            "intent": "recommendation",
+            "author": "Mark Twain that are connected to travel",
+        },
+    )
+
+    assert merged.author == "Mark Twain"
+
+
+def test_merge_llm_extraction_ignores_llm_only_author_for_title_reference() -> None:
+    base = book_agent.heuristic_extract_request(
+        user_message(
+            "Suggest something like Frankenstein, but do not recommend Frankenstein itself."
+        )
+    )
+
+    merged = book_agent.merge_llm_extraction(
+        base,
+        {
+            "intent": "title_reference",
+            "author": "Mary Shelley",
+            "title_reference": "Frankenstein",
+        },
+    )
+
+    assert merged.intent == "title_reference"
+    assert merged.author is None
+    assert merged.title_reference == "Frankenstein"
 
 
 def test_title_reference_topics_exclude_source_title_terms() -> None:

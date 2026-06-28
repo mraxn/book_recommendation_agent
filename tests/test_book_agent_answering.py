@@ -93,6 +93,30 @@ def test_generate_grounded_answer_accepts_selected_titles() -> None:
     assert provider.text_calls == 1
 
 
+def test_generate_grounded_answer_normalizes_wrong_opening_sentence() -> None:
+    selected = [
+        ranked("1", "A Tramp Abroad"),
+        ranked("2", "A Connecticut Yankee in King Arthur's Court"),
+    ]
+    provider = FakeProvider(
+        text="Here are 2 retrieved alternatives:\n"
+        "1. **A Tramp Abroad** by Twain, Mark (1880) - matches travel.\n"
+        "2. **A Connecticut Yankee in King Arthur's Court** by Twain, Mark (1889) - matches travel."
+    )
+    request = book_agent.ExtractedRequest(
+        query="Find books by Mark Twain connected to travel",
+        intent="author_lookup",
+        author="Mark Twain",
+        requested_count=2,
+    )
+
+    answer = run(book_agent.generate_grounded_answer(request, selected, provider))
+
+    assert answer.startswith("Here are 2 retrieved matches:")
+    assert "retrieved alternatives" not in answer
+    assert "**A Tramp Abroad**" in answer
+
+
 def test_generate_grounded_answer_rejects_unretrieved_titles() -> None:
     selected = [ranked("1", "Frankenstein")]
     provider = FakeProvider(
@@ -205,6 +229,17 @@ def test_answer_uses_numbered_list() -> None:
     assert not book_agent.answer_uses_numbered_list("- **Book** by Author - reason.")
 
 
+def test_answer_has_required_opening() -> None:
+    assert book_agent.answer_has_required_opening(
+        "Here are 2 retrieved matches:\n1. **Book** by Author - reason.",
+        "Here are 2 retrieved matches:",
+    )
+    assert not book_agent.answer_has_required_opening(
+        "Here are 2 retrieved alternatives:\n1. **Book** by Author - reason.",
+        "Here are 2 retrieved matches:",
+    )
+
+
 def test_answer_has_unique_recommendation_titles() -> None:
     assert book_agent.answer_has_unique_recommendation_titles(
         "1. **Frankenstein** by Shelley - reason.\n2. **Dracula** by Stoker - reason."
@@ -225,6 +260,18 @@ def test_normalize_llm_answer_format_preserves_good_numbered_content() -> None:
     assert normalized == "1. **Frankenstein** by Shelley - specific gothic reason."
     assert book_agent.answer_uses_numbered_list(normalized)
     assert book_agent.answer_mentions_only_selected_titles(normalized, selected)
+
+
+def test_normalize_llm_answer_format_replaces_wrong_intro() -> None:
+    selected = [book_agent.BookCandidate(id="1", score=1, title="Book")]
+
+    normalized = book_agent.normalize_llm_answer_format(
+        "Here are 1 retrieved alternatives:\n1. Book by Author - reason.",
+        selected,
+        opening_sentence="Here is one retrieved match:",
+    )
+
+    assert normalized == "Here is one retrieved match:\n1. **Book** by Author - reason."
 
 
 def test_normalize_llm_answer_format_does_not_nest_overlapping_bold_titles() -> None:

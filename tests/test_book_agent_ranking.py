@@ -123,6 +123,100 @@ def test_rank_candidates_enforces_language_and_year_constraints() -> None:
     assert [item.candidate.id for item in ranked] == ["valid"]
 
 
+def test_rank_candidates_can_relax_year_while_still_enforcing_language() -> None:
+    request = book_agent.ExtractedRequest(
+        query="English philosophical novels before 1900",
+        intent="recommendation",
+        language_code="en",
+        year=book_agent.YearConstraint(lte=1899),
+        topics=("philosophical",),
+    )
+    candidates = book_agent.candidates_from_matches(
+        [
+            make_match(
+                book_id="wrong-language",
+                score=0.99,
+                title="French Book",
+                languages=["fr"],
+                subjects=["Philosophy"],
+                first_publish_year=1880,
+            ),
+            make_match(
+                book_id="relaxed-year",
+                score=0.95,
+                title="Modern English Book",
+                languages=["en"],
+                subjects=["Philosophy"],
+                first_publish_year=1910,
+            ),
+            make_match(
+                book_id="valid",
+                score=0.9,
+                title="Valid Book",
+                languages=["en"],
+                subjects=["Philosophy"],
+                first_publish_year=1880,
+            ),
+        ]
+    )
+
+    ranked = book_agent.rank_candidates(
+        candidates,
+        request,
+        enforce_language_filter=True,
+        enforce_year_filter=False,
+    )
+
+    assert [item.candidate.id for item in ranked] == ["valid", "relaxed-year"]
+
+
+def test_rank_candidates_can_relax_language_while_still_enforcing_year() -> None:
+    request = book_agent.ExtractedRequest(
+        query="French philosophical novels before 1900",
+        intent="recommendation",
+        language_code="fr",
+        year=book_agent.YearConstraint(lte=1899),
+        topics=("philosophical",),
+    )
+    candidates = book_agent.candidates_from_matches(
+        [
+            make_match(
+                book_id="wrong-year",
+                score=0.99,
+                title="Modern French Book",
+                languages=["fr"],
+                subjects=["Philosophy"],
+                first_publish_year=1910,
+            ),
+            make_match(
+                book_id="relaxed-language",
+                score=0.95,
+                title="English Period Book",
+                languages=["en"],
+                subjects=["Philosophy"],
+                first_publish_year=1880,
+            ),
+            make_match(
+                book_id="valid",
+                score=0.9,
+                title="Valid French Book",
+                languages=["fr"],
+                subjects=["Philosophy"],
+                first_publish_year=1880,
+            ),
+        ]
+    )
+
+    ranked = book_agent.rank_candidates(
+        candidates,
+        request,
+        enforce_language_filter=False,
+        enforce_year_filter=True,
+    )
+
+    assert [item.candidate.id for item in ranked] == ["valid", "relaxed-language"]
+
+
 def test_rank_candidates_boosts_topic_author_and_popularity() -> None:
     request = book_agent.ExtractedRequest(
         query="popular travel books by Mark Twain",
@@ -157,6 +251,71 @@ def test_rank_candidates_boosts_topic_author_and_popularity() -> None:
 
     assert ranked[0].candidate.id == "twain"
     assert "matches Mark Twain" in ranked[0].reason
+
+
+def test_rank_candidates_filters_other_authors_for_author_lookup() -> None:
+    request = book_agent.ExtractedRequest(
+        query="Find books by Mark Twain connected to travel",
+        intent="author_lookup",
+        author="Mark Twain",
+        topics=("travel",),
+        wants_popular=True,
+    )
+    candidates = book_agent.candidates_from_matches(
+        [
+            make_match(
+                book_id="other",
+                score=0.99,
+                title="Camp-fire and Wigwam",
+                authors=["Ellis, Edward Sylvester"],
+                subjects=["Travel"],
+                download_count=5000,
+            ),
+            make_match(
+                book_id="twain",
+                score=0.7,
+                title="A Tramp Abroad",
+                authors=["Twain, Mark"],
+                subjects=["Travel"],
+                download_count=3000,
+            ),
+        ]
+    )
+
+    ranked = book_agent.rank_candidates(candidates, request, enforce_hard_filters=False)
+
+    assert [item.candidate.id for item in ranked] == ["twain"]
+
+
+def test_rank_candidates_filters_other_authors_when_intent_changes_but_author_remains() -> None:
+    request = book_agent.ExtractedRequest(
+        query="Find books by Mark Twain connected to travel",
+        intent="recommendation",
+        author="Mark Twain",
+        topics=("travel",),
+    )
+    candidates = book_agent.candidates_from_matches(
+        [
+            make_match(
+                book_id="other",
+                score=0.99,
+                title="The Jungle Book",
+                authors=["Kipling, Rudyard"],
+                subjects=["Travel"],
+            ),
+            make_match(
+                book_id="twain",
+                score=0.7,
+                title="A Tramp Abroad",
+                authors=["Twain, Mark"],
+                subjects=["Travel"],
+            ),
+        ]
+    )
+
+    ranked = book_agent.rank_candidates(candidates, request, enforce_hard_filters=False)
+
+    assert [item.candidate.id for item in ranked] == ["twain"]
 
 
 def test_rank_candidates_matches_single_author_surname() -> None:

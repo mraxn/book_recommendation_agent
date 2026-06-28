@@ -7,7 +7,7 @@ import math
 import os
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, TypedDict, cast
 
@@ -27,6 +27,10 @@ DEFAULT_MAX_TOKENS = 900
 DEFAULT_SEARCH_TOP_K = 20
 MAX_SEARCHES_PER_REQUEST = 3
 MIN_CANDIDATES_BEFORE_RELAX = 3
+OFF_TOPIC_RESPONSE = (
+    "I can help with book recommendations and book searches. "
+    "Tell me what kind of book you want."
+)
 
 LANGUAGE_NAME_TO_CODE = {
     "english": "en",
@@ -216,7 +220,7 @@ class AgentState(TypedDict, total=False):
     messages: list[ChatMessage]
     request: ExtractedRequest
     provider: LLMProvider | None
-    search_fn: Any
+    search_fn: SearchFn
     retrieval: RetrievalResult
     ranked_candidates: list[RankedCandidate]
     selected: list[RankedCandidate]
@@ -245,12 +249,21 @@ class LLMProvider(Protocol):
         """Return a parsed JSON completion for the prompt."""
 
 
+SearchMatch = dict[str, Any]
+SearchFn = Callable[[str, dict[str, Any] | None, int], list[SearchMatch]]
+
+
 logger = logging.getLogger(__name__)
 
 
 def configure_book_agent_logging(level_name: str | None = None) -> None:
-    resolved_level = level_name or os.getenv("BOOK_AGENT_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
-    level = getattr(logging, resolved_level.upper(), logging.INFO)
+    raw_level = level_name or os.getenv("BOOK_AGENT_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
+    resolved_level = raw_level.strip().upper()
+    level = getattr(logging, resolved_level, None)
+    invalid_level = not isinstance(level, int)
+    if invalid_level:
+        level = logging.INFO
+        resolved_level = "INFO"
     logger.setLevel(level)
 
     if not logger.handlers:
@@ -259,6 +272,8 @@ def configure_book_agent_logging(level_name: str | None = None) -> None:
         logger.addHandler(handler)
 
     logger.propagate = False
+    if invalid_level:
+        logger.warning("Invalid book agent log level=%s; using INFO", raw_level)
     logger.info("Book agent logging configured level=%s", logging.getLevelName(level))
 
 
@@ -597,9 +612,12 @@ def detect_title_reference(text: str) -> tuple[str | None, str | None]:
 
 def detect_author_query(text: str) -> str | None:
     patterns = [
-        r"\bby\s+(.+?)(?:\s+about|\s+in\s+[A-Z]|\s+before|\s+after|\s+between|$)",
+        (
+            r"\bby\s+(.+?)(?=\s+(?:about|that\b|who\b|which\b|whose\b|connected\b|"
+            r"with\b|before|after|between|prefer|preferably|in\s+[A-Z])|[,.;?!]|$)"
+        ),
         r"\bwhat did\s+(.+?)\s+write\b",
-        r"\bbooks?\s+from\s+(.+?)(?:\s+about|$)",
+        r"\bbooks?\s+from\s+(.+?)(?=\s+(?:about|that\b|who\b|which\b|with\b)|[,.;?!]|$)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -780,15 +798,22 @@ def merge_llm_extraction(base: ExtractedRequest, payload: Any) -> ExtractedReque
 
     topics = _merge_topics(base.topics, payload.get("topics"))
     title_reference = _clean_title_phrase(_clean_optional_string(payload.get("title_reference")) or "")
-    effective_title_reference = title_reference or base.title_reference
+    should_use_title_reference = intent in {"title_reference", "follow_up"} or base.title_reference is not None
+    effective_title_reference = (title_reference or base.title_reference) if should_use_title_reference else None
     if effective_title_reference:
         topics = tuple(_remove_reference_terms_from_topics(list(topics), effective_title_reference))
 
     typed_intent = cast(Intent, intent)
+    llm_author = _clean_optional_string(payload.get("author"))
+    effective_author = (
+        _merge_author(base.author, llm_author)
+        if base.author or typed_intent == "author_lookup"
+        else None
+    )
     return replace(
         base,
         intent=typed_intent,
-        author=_clean_optional_string(payload.get("author")) or base.author,
+        author=effective_author,
         title=_clean_optional_string(payload.get("title")) or base.title,
         title_reference=effective_title_reference,
         language_code=language_code,
@@ -801,7 +826,7 @@ def merge_llm_extraction(base: ExtractedRequest, payload: Any) -> ExtractedReque
     )
 
 
-def candidate_from_match(match: dict[str, Any]) -> BookCandidate | None:
+def candidate_from_match(match: SearchMatch) -> BookCandidate | None:
     metadata = match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
     title = str(metadata.get("title") or "").strip()
     candidate_id = str(match.get("id") or "").strip()
@@ -823,8 +848,8 @@ def candidate_from_match(match: dict[str, Any]) -> BookCandidate | None:
     )
 
 
-def candidates_from_matches(matches: list[dict[str, Any]]) -> list[BookCandidate]:
-    candidates = [candidate_from_match(match) for match in matches]
+def candidates_from_matches(matches: list[SearchMatch]) -> list[BookCandidate]:
+    candidates = [candidate_from_match(match) for match in matches if isinstance(match, dict)]
     return [candidate for candidate in candidates if candidate is not None]
 
 
@@ -864,13 +889,22 @@ def rank_candidates(
     candidates: list[BookCandidate],
     request: ExtractedRequest,
     enforce_hard_filters: bool = True,
+    *,
+    enforce_language_filter: bool | None = None,
+    enforce_year_filter: bool | None = None,
 ) -> list[RankedCandidate]:
+    if enforce_language_filter is None:
+        enforce_language_filter = enforce_hard_filters
+    if enforce_year_filter is None:
+        enforce_year_filter = enforce_hard_filters
+
     deduped = deduplicate_candidates(candidates)
     logger.info(
-        "Ranking candidates received=%d deduped=%d enforce_hard_filters=%s",
+        "Ranking candidates received=%d deduped=%d enforce_language_filter=%s enforce_year_filter=%s",
         len(candidates),
         len(deduped),
-        enforce_hard_filters,
+        enforce_language_filter,
+        enforce_year_filter,
     )
     if request.title_reference:
         before_reference_filter = len(deduped)
@@ -885,11 +919,31 @@ def rank_candidates(
             before_reference_filter - len(deduped),
             len(deduped),
         )
-    if enforce_hard_filters:
-        before_hard_filters = len(deduped)
-        deduped = [candidate for candidate in deduped if candidate_matches_request(candidate, request)]
+    if request.author:
+        before_author_filter = len(deduped)
+        deduped = [candidate for candidate in deduped if _matches_author(candidate, request.author)]
         logger.info(
-            "Applied hard filters removed=%d remaining=%d",
+            "Applied explicit author filter author=%s removed=%d remaining=%d",
+            request.author,
+            before_author_filter - len(deduped),
+            len(deduped),
+        )
+    if enforce_language_filter or enforce_year_filter:
+        before_hard_filters = len(deduped)
+        deduped = [
+            candidate
+            for candidate in deduped
+            if candidate_matches_request(
+                candidate,
+                request,
+                enforce_language=enforce_language_filter,
+                enforce_year=enforce_year_filter,
+            )
+        ]
+        logger.info(
+            "Applied hard filters language=%s year=%s removed=%d remaining=%d",
+            enforce_language_filter,
+            enforce_year_filter,
             before_hard_filters - len(deduped),
             len(deduped),
         )
@@ -928,16 +982,17 @@ def select_recommendations(
     return selected
 
 
-def candidate_matches_request(candidate: BookCandidate, request: ExtractedRequest) -> bool:
-    if request.language_code and request.language_code not in candidate.languages:
+def candidate_matches_request(
+    candidate: BookCandidate,
+    request: ExtractedRequest,
+    *,
+    enforce_language: bool = True,
+    enforce_year: bool = True,
+) -> bool:
+    if enforce_language and request.language_code and request.language_code not in candidate.languages:
         return False
-    if request.year:
-        if candidate.first_publish_year is None:
-            return False
-        if request.year.gte is not None and candidate.first_publish_year < request.year.gte:
-            return False
-        if request.year.lte is not None and candidate.first_publish_year > request.year.lte:
-            return False
+    if enforce_year and not _matches_year_constraint(candidate, request.year):
+        return False
     return True
 
 
@@ -1042,8 +1097,9 @@ async def generate_grounded_answer(
         relaxed_year,
         relaxed_language,
     )
+    opening_sentence = _answer_opening_sentence(request, len(selected))
     prompt = ANSWER_PROMPT.format(
-        opening_sentence=_answer_opening_sentence(request, len(selected)),
+        opening_sentence=opening_sentence,
         query_context=_answer_query_context(request),
         books="\n".join(_answer_prompt_line(item) for item in selected),
     )
@@ -1052,6 +1108,7 @@ async def generate_grounded_answer(
         answer = normalize_llm_answer_format(
             strip_model_artifacts(await asyncio.to_thread(provider.complete_text, prompt)),
             [item.candidate for item in selected],
+            opening_sentence=opening_sentence,
         )
         logger.debug(
             "LLM answer generation completed provider=%s elapsed_ms=%d chars=%d",
@@ -1070,6 +1127,7 @@ async def generate_grounded_answer(
 
     if (
         answer_uses_numbered_list(answer)
+        and answer_has_required_opening(answer, opening_sentence)
         and answer_mentions_only_selected_titles(
             answer,
             [item.candidate for item in selected],
@@ -1162,25 +1220,38 @@ def answer_uses_numbered_list(answer: str) -> bool:
     return bool(re.search(r"(?m)^\s*1\.\s+", answer))
 
 
+def answer_has_required_opening(answer: str, opening_sentence: str) -> bool:
+    first_line = next((line.strip() for line in answer.splitlines() if line.strip()), "")
+    return first_line == opening_sentence
+
+
 def answer_has_unique_recommendation_titles(answer: str) -> bool:
     titles = [normalize_title(title) for title in _extract_markdown_titles(answer)]
     return len(titles) == len(set(titles))
 
 
-def normalize_llm_answer_format(answer: str, selected: list[BookCandidate]) -> str:
+def normalize_llm_answer_format(
+    answer: str,
+    selected: list[BookCandidate],
+    *,
+    opening_sentence: str | None = None,
+) -> str:
     normalized_lines: list[str] = []
     for line in answer.splitlines():
         normalized_line = re.sub(r"^(\s*)[-*]\s+(\d+\.\s+)", r"\1\2", line)
         for candidate in selected:
             normalized_line = _bold_title_once(normalized_line, candidate.title)
         normalized_lines.append(normalized_line)
-    return "\n".join(normalized_lines).strip()
+    normalized_answer = "\n".join(normalized_lines).strip()
+    if opening_sentence is None:
+        return normalized_answer
+    return _ensure_answer_opening(normalized_answer, opening_sentence)
 
 
 async def run_book_agent(
     messages: list[ChatMessage],
     *,
-    search_fn: Any | None = None,
+    search_fn: SearchFn | None = None,
     provider: Any = _PROVIDER_UNSET,
 ) -> str:
     start = time.perf_counter()
@@ -1287,12 +1358,13 @@ def build_initial_search_plans(request: ExtractedRequest) -> list[SearchPlan]:
 
 async def retrieve_candidates_for_request(
     request: ExtractedRequest,
-    search_fn: Any | None = None,
+    search_fn: SearchFn | None = None,
 ) -> RetrievalResult:
     search = search_fn or _default_search_books
     candidates: list[BookCandidate] = []
     errors: list[str] = []
     search_count = 0
+    search_attempts = 0
     relaxed_year = False
     relaxed_language = False
     logger.info(
@@ -1304,6 +1376,9 @@ async def retrieve_candidates_for_request(
     )
 
     for plan in build_initial_search_plans(request):
+        if search_attempts >= MAX_SEARCHES_PER_REQUEST:
+            break
+        search_attempts += 1
         try:
             logger.info(
                 "Running search plan purpose=%s top_k=%d filters=%s query=%s",
@@ -1314,6 +1389,8 @@ async def retrieve_candidates_for_request(
             )
             start = time.perf_counter()
             matches = await asyncio.to_thread(search, plan.query_text, plan.filters, plan.top_k)
+            if not isinstance(matches, list):
+                raise TypeError(f"search returned {type(matches).__name__}, expected list")
         except Exception as exc:
             errors.append(str(exc))
             logger.warning("Book search failed for %s plan: %s", plan.purpose, exc)
@@ -1332,7 +1409,7 @@ async def retrieve_candidates_for_request(
     if (
         request.year
         and len(deduped) < MIN_CANDIDATES_BEFORE_RELAX
-        and search_count < MAX_SEARCHES_PER_REQUEST
+        and search_attempts < MAX_SEARCHES_PER_REQUEST
     ):
         relaxed_year = True
         logger.info(
@@ -1346,6 +1423,7 @@ async def retrieve_candidates_for_request(
             purpose="relaxed_year",
             relaxed_year=True,
         )
+        search_attempts += 1
         matches = await _run_search_plan(search, plan, errors)
         search_count += 1 if matches is not None else 0
         candidates.extend(candidates_from_matches(matches or []))
@@ -1355,7 +1433,7 @@ async def retrieve_candidates_for_request(
     if (
         request.language_code
         and not deduped
-        and search_count < MAX_SEARCHES_PER_REQUEST
+        and search_attempts < MAX_SEARCHES_PER_REQUEST
     ):
         relaxed_language = True
         logger.info("Relaxing language filter because no deduped candidates remain")
@@ -1366,6 +1444,7 @@ async def retrieve_candidates_for_request(
             relaxed_language=True,
             relaxed_year=relaxed_year,
         )
+        search_attempts += 1
         matches = await _run_search_plan(search, plan, errors)
         search_count += 1 if matches is not None else 0
         candidates.extend(candidates_from_matches(matches or []))
@@ -1376,9 +1455,10 @@ async def retrieve_candidates_for_request(
         raise RetrievalError("; ".join(errors))
 
     logger.info(
-        "Retrieval completed candidates=%d searches=%d relaxed_year=%s relaxed_language=%s errors=%d",
+        "Retrieval completed candidates=%d successful_searches=%d attempted_searches=%d relaxed_year=%s relaxed_language=%s errors=%d",
         len(deduped),
         search_count,
+        search_attempts,
         relaxed_year,
         relaxed_language,
         len(errors),
@@ -1467,10 +1547,10 @@ def _ranked_title_summary(items: list[RankedCandidate], limit: int = 3) -> list[
 
 
 async def _run_search_plan(
-    search: Any,
+    search: SearchFn,
     plan: SearchPlan,
     errors: list[str],
-) -> list[dict[str, Any]] | None:
+) -> list[SearchMatch] | None:
     try:
         logger.info(
             "Running fallback search plan purpose=%s top_k=%d filters=%s query=%s",
@@ -1481,6 +1561,8 @@ async def _run_search_plan(
         )
         start = time.perf_counter()
         matches = await asyncio.to_thread(search, plan.query_text, plan.filters, plan.top_k)
+        if not isinstance(matches, list):
+            raise TypeError(f"search returned {type(matches).__name__}, expected list")
         logger.info(
             "Fallback search plan completed purpose=%s matches=%d elapsed_ms=%d",
             plan.purpose,
@@ -1498,7 +1580,7 @@ def _default_search_books(
     query_text: str,
     filters: dict[str, Any] | None,
     top_k: int,
-) -> list[dict[str, Any]]:
+) -> list[SearchMatch]:
     from backend.app.services.pinecone_utils import search_books
 
     return search_books(query_text=query_text, filters=filters, top_k=top_k)
@@ -1547,6 +1629,28 @@ def _bold_title_once(line: str, title: str) -> str:
     return f"{line[:match.start()]}**{line[match.start():match.end()]}**{line[match.end():]}"
 
 
+def _ensure_answer_opening(answer: str, opening_sentence: str) -> str:
+    if not answer:
+        return opening_sentence
+
+    lines = answer.splitlines()
+    first_content_index = next(
+        (index for index, line in enumerate(lines) if line.strip()),
+        None,
+    )
+    if first_content_index is None:
+        return opening_sentence
+
+    first_content = lines[first_content_index].strip()
+    if first_content == opening_sentence:
+        return answer.strip()
+    if re.match(r"^\d+\.\s+", first_content):
+        return f"{opening_sentence}\n{answer.strip()}"
+
+    lines[first_content_index] = opening_sentence
+    return "\n".join(lines).strip()
+
+
 def _relaxation_note(*, relaxed_year: bool, relaxed_language: bool) -> str:
     if relaxed_year and relaxed_language:
         return "I found too few exact language/year matches, so I broadened the search.\n\n"
@@ -1593,10 +1697,7 @@ async def _extract_node(state: AgentState) -> AgentState:
         logger.info("Graph node extract classified off_topic query=%s", _query_preview(base_request.query))
         return {
             "request": base_request,
-            "final_answer": (
-                "I can help with book recommendations and book searches. "
-                "Tell me what kind of book you want."
-            ),
+            "final_answer": OFF_TOPIC_RESPONSE,
         }
 
     updates: AgentState = {}
@@ -1613,6 +1714,13 @@ async def _extract_node(state: AgentState) -> AgentState:
         updates.get("provider"),
         base_request=base_request,
     )
+    if updates["request"].intent == "off_topic":
+        logger.info(
+            "Graph node extract classified off_topic after LLM query=%s",
+            _query_preview(updates["request"].query),
+        )
+        updates["final_answer"] = OFF_TOPIC_RESPONSE
+        return updates
     logger.info(
         "Graph node extract completed intent=%s count=%s",
         updates["request"].intent,
@@ -1652,11 +1760,11 @@ async def _rank_node(state: AgentState) -> AgentState:
     logger.info("Graph node rank started")
     request = state["request"]
     retrieval = state["retrieval"]
-    enforce_filters = not (retrieval.relaxed_year or retrieval.relaxed_language)
     ranked = rank_candidates(
         retrieval.candidates,
         request,
-        enforce_hard_filters=enforce_filters,
+        enforce_language_filter=not retrieval.relaxed_language,
+        enforce_year_filter=not retrieval.relaxed_year,
     )
     ranked = await maybe_llm_rerank(ranked, request, state.get("provider"))
     selected = select_recommendations(ranked, request.requested_count)
@@ -1823,6 +1931,19 @@ def _merge_topics(base_topics: tuple[str, ...], llm_topics: Any) -> tuple[str, .
     return tuple(merged)
 
 
+def _merge_author(base_author: str | None, llm_author: str | None) -> str | None:
+    if not base_author:
+        return llm_author
+    if not llm_author:
+        return base_author
+
+    base_normalized = normalize_text(base_author)
+    llm_normalized = normalize_text(llm_author)
+    if len(base_normalized.split()) == 1 and re.search(rf"\b{re.escape(base_normalized)}\b", llm_normalized):
+        return llm_author
+    return base_author
+
+
 def _clean_optional_string(value: Any) -> str | None:
     if value is None:
         return None
@@ -1871,7 +1992,7 @@ def _score_candidate(
         rank_score += 1.5
         reason_parts.append(f"available in {language_display(request.language_code)}")
 
-    if request.year and candidate.first_publish_year is not None:
+    if request.year and _matches_year_constraint(candidate, request.year):
         rank_score += 1.0
         reason_parts.append("fits the requested publication period")
 
@@ -1893,6 +2014,18 @@ def _matches_author(candidate: BookCandidate, author_query: str) -> bool:
         for variant in variants
         for candidate_author in candidate_authors
     )
+
+
+def _matches_year_constraint(candidate: BookCandidate, year: YearConstraint | None) -> bool:
+    if year is None:
+        return True
+    if candidate.first_publish_year is None:
+        return False
+    if year.gte is not None and candidate.first_publish_year < year.gte:
+        return False
+    if year.lte is not None and candidate.first_publish_year > year.lte:
+        return False
+    return True
 
 
 def _is_reference_title_candidate(candidate_title: str, reference_title: str) -> bool:
