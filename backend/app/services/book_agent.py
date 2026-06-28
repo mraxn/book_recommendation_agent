@@ -1200,7 +1200,7 @@ def _extract_markdown_titles(answer: str) -> list[str]:
 
 
 def _bold_title_once(line: str, title: str) -> str:
-    if f"**{title}**" in line:
+    if "**" in line:
         return line
     pattern = re.compile(re.escape(title), flags=re.IGNORECASE)
     match = pattern.search(line)

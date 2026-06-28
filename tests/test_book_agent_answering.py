@@ -167,6 +167,27 @@ def test_normalize_llm_answer_format_preserves_good_numbered_content() -> None:
     assert book_agent.answer_mentions_only_selected_titles(normalized, selected)
 
 
+def test_normalize_llm_answer_format_does_not_nest_overlapping_bold_titles() -> None:
+    selected = [
+        book_agent.BookCandidate(id="short", score=1, title="The Turn of the Screw"),
+        book_agent.BookCandidate(
+            id="long",
+            score=1,
+            title="The Two Magics: The Turn of the Screw, Covering End",
+        ),
+    ]
+
+    normalized = book_agent.normalize_llm_answer_format(
+        "1. **The Two Magics: The Turn of the Screw, Covering End** by James - reason.",
+        selected,
+    )
+
+    assert normalized == (
+        "1. **The Two Magics: The Turn of the Screw, Covering End** by James - reason."
+    )
+    assert book_agent.answer_mentions_only_selected_titles(normalized, selected)
+
+
 def test_answer_prompt_explicitly_forbids_bullet_lists() -> None:
     assert 'must start with "1. "' in book_agent.ANSWER_PROMPT
     assert 'never "-"' in book_agent.ANSWER_PROMPT
