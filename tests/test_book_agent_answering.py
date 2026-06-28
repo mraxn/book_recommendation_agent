@@ -152,3 +152,25 @@ def test_answer_validation_requires_selected_markdown_titles() -> None:
 def test_answer_uses_numbered_list() -> None:
     assert book_agent.answer_uses_numbered_list("Intro\n1. **Book** by Author - reason.")
     assert not book_agent.answer_uses_numbered_list("- **Book** by Author - reason.")
+
+
+def test_normalize_llm_answer_format_preserves_good_numbered_content() -> None:
+    selected = [book_agent.BookCandidate(id="1", score=1, title="Frankenstein")]
+
+    normalized = book_agent.normalize_llm_answer_format(
+        "- 1. Frankenstein by Shelley - specific gothic reason.",
+        selected,
+    )
+
+    assert normalized == "1. **Frankenstein** by Shelley - specific gothic reason."
+    assert book_agent.answer_uses_numbered_list(normalized)
+    assert book_agent.answer_mentions_only_selected_titles(normalized, selected)
+
+
+def test_answer_prompt_explicitly_forbids_bullet_lists() -> None:
+    assert 'must start with "1. "' in book_agent.ANSWER_PROMPT
+    assert 'never "-"' in book_agent.ANSWER_PROMPT
+    assert "Wrap every book title in **bold markdown**" in book_agent.ANSWER_PROMPT
+    assert "Do not use bullet points" in book_agent.ANSWER_PROMPT
+    assert 'Do not write "Reason sentence"' in book_agent.ANSWER_PROMPT
+    assert "specific reason from the supplied reason/text" in book_agent.ANSWER_PROMPT

@@ -78,7 +78,20 @@ Latest user request: {query}
 
 ANSWER_PROMPT = """Write a concise book recommendation answer in markdown.
 Use only the supplied retrieved books. Do not mention any other book title.
-Use a numbered list. Each item must include title, author, optional year, and one short reason.
+
+Required format:
+- Start with one short sentence.
+- Then write a numbered markdown list only.
+- Every recommendation line must start with "1. ", "2. ", "3. ", etc.
+- The first character of each recommendation line must be the number, never "-".
+- Wrap every book title in **bold markdown** exactly as supplied.
+- Do not use bullet points, hyphen lists, tables, or headings.
+- Each item must follow this pattern:
+  N. **exact supplied title** by supplied author (year if known) - specific reason from the supplied reason/text.
+- Do not copy template words or use generic placeholder reasons.
+- Reasons must be concrete and based on the supplied retrieved-book data.
+
+Do not write "Reason sentence" or similar placeholder text.
 
 User request: {query}
 
@@ -868,7 +881,10 @@ async def generate_grounded_answer(
         books="\n".join(_answer_prompt_line(item) for item in selected),
     )
     try:
-        answer = strip_model_artifacts(await asyncio.to_thread(provider.complete_text, prompt))
+        answer = normalize_llm_answer_format(
+            strip_model_artifacts(await asyncio.to_thread(provider.complete_text, prompt)),
+            [item.candidate for item in selected],
+        )
     except Exception as exc:
         logger.warning("LLM answer generation failed with %s: %s", getattr(provider, "name", "unknown"), exc)
         return build_deterministic_answer(
@@ -930,6 +946,16 @@ def answer_mentions_only_selected_titles(answer: str, selected: list[BookCandida
 
 def answer_uses_numbered_list(answer: str) -> bool:
     return bool(re.search(r"(?m)^\s*1\.\s+", answer))
+
+
+def normalize_llm_answer_format(answer: str, selected: list[BookCandidate]) -> str:
+    normalized_lines: list[str] = []
+    for line in answer.splitlines():
+        normalized_line = re.sub(r"^(\s*)[-*]\s+(\d+\.\s+)", r"\1\2", line)
+        for candidate in selected:
+            normalized_line = _bold_title_once(normalized_line, candidate.title)
+        normalized_lines.append(normalized_line)
+    return "\n".join(normalized_lines).strip()
 
 
 async def run_book_agent(
@@ -1171,6 +1197,16 @@ def _extract_markdown_titles(answer: str) -> list[str]:
         if match:
             numbered_titles.append(match.group(1).strip(" *"))
     return numbered_titles
+
+
+def _bold_title_once(line: str, title: str) -> str:
+    if f"**{title}**" in line:
+        return line
+    pattern = re.compile(re.escape(title), flags=re.IGNORECASE)
+    match = pattern.search(line)
+    if not match:
+        return line
+    return f"{line[:match.start()]}**{line[match.start():match.end()]}**{line[match.end():]}"
 
 
 def _relaxation_note(*, relaxed_year: bool, relaxed_language: bool) -> str:
